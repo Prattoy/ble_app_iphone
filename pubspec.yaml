@@ -32,6 +32,8 @@ dependencies:
     sdk: flutter
   flutter_bluetooth_serial: ^0.4.0
   permission_handler: ^10.4.4
+  sensors_plus: ^2.0.0  # For accelerometer
+  flutter_compass: ^0.8.1  # For compass
 
 
   # The following adds the Cupertino Icons font to your application.
