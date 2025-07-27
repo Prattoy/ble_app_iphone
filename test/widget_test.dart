@@ -1,30 +1,40 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// This is a basic Flutter widget test for the LED Control BLE app.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:flutter_ble_app/main.dart';
+import 'package:led_control_ble/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
+  testWidgets('LED Control app smoke test', (WidgetTester tester) async {
     // Build our app and trigger a frame.
     await tester.pumpWidget(MyApp());
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    // Verify that the app loads with the correct title
+    expect(find.text('LED Control BLE'), findsOneWidget);
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+    // Verify that we have the connection status text
+    expect(find.text('Disconnected'), findsOneWidget);
+
+    // Verify that we have the scan button
+    expect(find.text('Scan for ESP32'), findsOneWidget);
+
+    // Tap the scan button
+    await tester.tap(find.text('Scan for ESP32'));
     await tester.pump();
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    // Verify that scanning status appears
+    expect(find.text('Scanning for devices...'), findsOneWidget);
+  });
+
+  testWidgets('LED Control widgets exist', (WidgetTester tester) async {
+    // Build our app and trigger a frame.
+    await tester.pumpWidget(MyApp());
+
+    // Verify the app bar title
+    expect(find.text('LED Control BLE'), findsOneWidget);
+
+    // Verify the scan button exists
+    expect(find.widgetWithText(ElevatedButton, 'Scan for ESP32'), findsOneWidget);
   });
 }
