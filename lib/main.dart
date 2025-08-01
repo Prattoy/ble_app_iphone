@@ -70,9 +70,20 @@ class _LEDControlPageState extends State<LEDControlPage> {
   }
 
   Future<void> _checkBluetoothPermissions() async {
+    print("Checking Bluetooth permissions...");
+
     if (Theme.of(context).platform == TargetPlatform.iOS) {
-      await Permission.bluetooth.request();
+      // For iOS, we only need bluetooth permission
+      PermissionStatus bluetoothStatus = await Permission.bluetooth.request();
+      print("iOS Bluetooth permission: $bluetoothStatus");
+
+      if (!bluetoothStatus.isGranted) {
+        setState(() {
+          connectionStatus = "Bluetooth permission denied";
+        });
+      }
     } else {
+      // Android permissions
       await Permission.bluetoothConnect.request();
       await Permission.bluetoothScan.request();
       await Permission.location.request();
@@ -82,46 +93,223 @@ class _LEDControlPageState extends State<LEDControlPage> {
   Future<bool> _checkSensorPermissions() async {
     print("Checking sensor permissions...");
 
-    // For iOS, we need location permission for compass
-    PermissionStatus locationStatus = await Permission.locationWhenInUse.request();
-    print("Location permission: $locationStatus");
-
-    // For iOS 13+, we need to explicitly request sensors permission
     if (Theme.of(context).platform == TargetPlatform.iOS) {
-      try {
-        PermissionStatus sensorsStatus = await Permission.sensors.request();
-        print("Sensors permission: $sensorsStatus");
+      // For iOS, location permission is required for compass
+      PermissionStatus locationStatus = await Permission.locationWhenInUse.status;
+      print("Current location permission status: $locationStatus");
 
-        if (!sensorsStatus.isGranted) {
-          print("Sensors permission denied");
-          setState(() {
-            sensorStatus = "Sensors permission denied";
-          });
-          return false;
-        }
-      } catch (e) {
-        print("Sensors permission error: $e");
-        // Continue anyway, might work without explicit permission
+      // If permission was never requested or denied, request it
+      if (locationStatus == PermissionStatus.denied) {
+        locationStatus = await Permission.locationWhenInUse.request();
+        print("Location permission after request: $locationStatus");
       }
-    }
 
-    return locationStatus.isGranted;
+      // Check if permanently denied
+      if (locationStatus == PermissionStatus.permanentlyDenied) {
+        setState(() {
+          sensorStatus = "Location permission permanently denied";
+        });
+        return false;
+      }
+
+      // For motion sensors on iOS, they don't require explicit permission in most cases
+      // The sensors should work if the app is in foreground
+      if (locationStatus.isGranted) {
+        return true;
+      } else {
+        setState(() {
+          sensorStatus = "Location permission required for compass";
+        });
+        return false;
+      }
+    } else {
+      // Android - check location permission
+      PermissionStatus locationStatus = await Permission.location.request();
+      return locationStatus.isGranted;
+    }
   }
 
   void _initSensors() async {
-    if (!await _checkSensorPermissions()) {
-      print("Location permissions denied");
-      setState(() {
-        sensorStatus = "Location permission denied";
-      });
-      return;
-    }
+    print("Initializing sensors...");
 
-    // Cancel existing subscriptions
+    // Cancel existing subscriptions first
     accelerometerSubscription?.cancel();
     userAccelerometerSubscription?.cancel();
     gyroscopeSubscription?.cancel();
 
+    setState(() {
+      sensorStatus = "Initializing sensors...";
+    });
+
+    // For iOS, try to initialize sensors without explicit permission check
+    // Motion sensors on iOS don't require permission in most cases
+    if (Theme.of(context).platform == TargetPlatform.iOS) {
+      await _initializeiOSSensors();
+    } else {
+      // For Android, check permissions first
+      if (!await _checkSensorPermissions()) {
+        print("Location permissions denied");
+        setState(() {
+          sensorStatus = "Location permission denied";
+        });
+        return;
+      }
+      await _initializeAndroidSensors();
+    }
+  }
+
+  Future<void> _initializeiOSSensors() async {
+    try {
+      // Try compass first (requires location permission)
+      bool hasLocationPermission = await _checkSensorPermissions();
+
+      if (hasLocationPermission) {
+        // Initialize compass
+        FlutterCompass.events?.listen((event) {
+          if (mounted && event.heading != null) {
+            setState(() {
+              heading = event.heading;
+            });
+          }
+        }).onError((error) {
+          print("Compass error: $error");
+        });
+      }
+
+      // Try motion sensors (usually work without explicit permission on iOS)
+      print("Testing iOS motion sensors...");
+
+      // Try regular accelerometer first (more reliable on iOS)
+      try {
+        print("Testing regular accelerometer on iOS...");
+
+        // Create a stream subscription without awaiting first event to avoid the sampling period issue
+        accelerometerSubscription = accelerometerEvents.listen((event) {
+          if (mounted) {
+            _processAccelerometerData(event.x, event.y, event.z, "regular");
+            // Set status on first successful event
+            if (sensorStatus.contains("Testing")) {
+              setState(() {
+                sensorStatus = hasLocationPermission
+                    ? "Accelerometer + compass active"
+                    : "Accelerometer active (no compass)";
+              });
+            }
+          }
+        }, onError: (error) {
+          print("Regular accelerometer error: $error");
+          accelerometerSubscription?.cancel();
+          _tryUserAccelerometer(hasLocationPermission);
+        });
+
+        // Wait a bit to see if we get data
+        await Future.delayed(Duration(seconds: 2));
+
+        // If we haven't gotten data yet, try user accelerometer
+        if (sensorStatus.contains("Testing")) {
+          accelerometerSubscription?.cancel();
+          _tryUserAccelerometer(hasLocationPermission);
+        }
+
+      } catch (e) {
+        print("Regular accelerometer setup failed: $e");
+        _tryUserAccelerometer(hasLocationPermission);
+      }
+
+    } catch (e) {
+      print("iOS sensor initialization error: $e");
+      setState(() {
+        sensorStatus = "iOS sensor error: $e";
+      });
+    }
+  }
+
+  Future<void> _tryUserAccelerometer(bool hasLocationPermission) async {
+    try {
+      print("Trying user accelerometer on iOS...");
+
+      userAccelerometerSubscription = userAccelerometerEvents.listen((event) {
+        if (mounted) {
+          _processAccelerometerData(event.x, event.y, event.z, "user");
+          // Set status on first successful event
+          if (sensorStatus.contains("Testing")) {
+            setState(() {
+              sensorStatus = hasLocationPermission
+                  ? "User accelerometer + compass active"
+                  : "User accelerometer active (no compass)";
+            });
+          }
+        }
+      }, onError: (error) {
+        print("User accelerometer error: $error");
+        userAccelerometerSubscription?.cancel();
+        _tryGyroscope(hasLocationPermission);
+      });
+
+      // Wait a bit to see if we get data
+      await Future.delayed(Duration(seconds: 2));
+
+      // If we haven't gotten data yet, try gyroscope
+      if (sensorStatus.contains("Testing")) {
+        userAccelerometerSubscription?.cancel();
+        _tryGyroscope(hasLocationPermission);
+      }
+
+    } catch (e) {
+      print("User accelerometer setup failed: $e");
+      _tryGyroscope(hasLocationPermission);
+    }
+  }
+
+  Future<void> _tryGyroscope(bool hasLocationPermission) async {
+    try {
+      print("Trying gyroscope on iOS...");
+
+      gyroscopeSubscription = gyroscopeEvents.listen((event) {
+        if (mounted) {
+          double rotationSpeed = (event.x.abs() + event.y.abs() + event.z.abs());
+          _processGyroscopeData(rotationSpeed);
+          // Set status on first successful event
+          if (sensorStatus.contains("Testing")) {
+            setState(() {
+              sensorStatus = hasLocationPermission
+                  ? "Gyroscope + compass active"
+                  : "Gyroscope active (no compass)";
+            });
+          }
+        }
+      }, onError: (error) {
+        print("Gyroscope error: $error");
+        gyroscopeSubscription?.cancel();
+        _allSensorsFailed(hasLocationPermission);
+      });
+
+      // Wait a bit to see if we get data
+      await Future.delayed(Duration(seconds: 2));
+
+      // If we haven't gotten data yet, all sensors failed
+      if (sensorStatus.contains("Testing")) {
+        gyroscopeSubscription?.cancel();
+        _allSensorsFailed(hasLocationPermission);
+      }
+
+    } catch (e) {
+      print("Gyroscope setup failed: $e");
+      _allSensorsFailed(hasLocationPermission);
+    }
+  }
+
+  void _allSensorsFailed(bool hasLocationPermission) {
+    print("All iOS sensors failed");
+    setState(() {
+      sensorStatus = hasLocationPermission
+          ? "Motion sensors unavailable (compass only)"
+          : "All sensors unavailable";
+      currentAcceleration = -1;
+    });
+  }
+
+  Future<void> _initializeAndroidSensors() async {
     try {
       // Compass listener
       FlutterCompass.events?.listen((event) {
@@ -134,7 +322,7 @@ class _LEDControlPageState extends State<LEDControlPage> {
         print("Compass error: $error");
       });
 
-      print("Attempting to initialize sensors...");
+      print("Attempting to initialize Android sensors...");
       setState(() {
         sensorStatus = "Testing sensors...";
       });
@@ -201,10 +389,114 @@ class _LEDControlPageState extends State<LEDControlPage> {
         }
       }
     } catch (e) {
-      print("Sensor initialization error: $e");
+      print("Android sensor initialization error: $e");
       setState(() {
-        sensorStatus = "Sensor error: $e";
+        sensorStatus = "Android sensor error: $e";
       });
+    }
+  }
+
+  // Add this helper method to manually request location permission
+  Future<void> _requestLocationPermission() async {
+    print("Manually requesting location permission...");
+
+    try {
+      PermissionStatus status = await Permission.locationWhenInUse.status;
+      print("Current location permission status: $status");
+
+      if (status == PermissionStatus.permanentlyDenied) {
+        // Show dialog to go to settings
+        if (mounted) {
+          showDialog(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: Text("Location Permission Required"),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("Location permission is needed for compass functionality. To enable:"),
+                  SizedBox(height: 10),
+                  Text("1. Go to iPhone Settings"),
+                  Text("2. Privacy & Security → Location Services"),
+                  Text("3. Find this app and select 'While Using App'"),
+                  SizedBox(height: 10),
+                  Text("Motion sensors should still work for flick detection."),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text("Cancel"),
+                ),
+                TextButton(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    openAppSettings();
+                  },
+                  child: Text("Open Settings"),
+                ),
+              ],
+            ),
+          );
+        }
+      } else if (status == PermissionStatus.denied) {
+        // Request permission
+        status = await Permission.locationWhenInUse.request();
+        print("Location permission request result: $status");
+
+        if (status.isGranted) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("Location permission granted! Compass should work now.")),
+            );
+          }
+          // Reinitialize compass specifically
+          _initializeCompass();
+        } else if (status == PermissionStatus.permanentlyDenied) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("Permission permanently denied. Motion sensors still work.")),
+            );
+          }
+        } else {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("Location permission denied. Motion sensors still work.")),
+            );
+          }
+        }
+      } else if (status.isGranted) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Permission already granted! Compass should work.")),
+          );
+        }
+        _initializeCompass();
+      }
+    } catch (e) {
+      print("Permission request error: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Permission error: $e")),
+        );
+      }
+    }
+  }
+
+  void _initializeCompass() {
+    try {
+      FlutterCompass.events?.listen((event) {
+        if (mounted && event.heading != null) {
+          setState(() {
+            heading = event.heading;
+          });
+        }
+      }).onError((error) {
+        print("Compass error: $error");
+      });
+    } catch (e) {
+      print("Compass initialization error: $e");
     }
   }
 
@@ -624,59 +916,7 @@ class _LEDControlPageState extends State<LEDControlPage> {
                       ),
                       SizedBox(height: 10),
                       ElevatedButton(
-                        onPressed: () async {
-                          PermissionStatus status = await Permission.locationWhenInUse.status;
-
-                          if (status.isPermanentlyDenied) {
-                            showDialog(
-                              context: context,
-                              builder: (context) => AlertDialog(
-                                title: Text("Location Permission Required"),
-                                content: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Text("Location permission was permanently denied. To enable compass and flick detection:"),
-                                    SizedBox(height: 10),
-                                    Text("1. Go to iPhone Settings"),
-                                    Text("2. Privacy & Security → Location Services"),
-                                    Text("3. Find this app and select 'While Using App'"),
-                                  ],
-                                ),
-                                actions: [
-                                  TextButton(
-                                    onPressed: () => Navigator.pop(context),
-                                    child: Text("Cancel"),
-                                  ),
-                                  TextButton(
-                                    onPressed: () {
-                                      Navigator.pop(context);
-                                      openAppSettings();
-                                    },
-                                    child: Text("Open Settings"),
-                                  ),
-                                ],
-                              ),
-                            );
-                          } else {
-                            status = await Permission.locationWhenInUse.request();
-                            print("Location permission status: $status");
-
-                            if (status.isGranted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text("Location permission granted! Compass should work now.")),
-                              );
-                              _initSensors();
-                            } else if (status.isPermanentlyDenied) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text("Permission permanently denied. Check app settings.")),
-                              );
-                            } else {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text("Location permission denied. Flick detection won't work.")),
-                              );
-                            }
-                          }
-                        },
+                        onPressed: _requestLocationPermission,
                         child: Text("Enable Location Permission"),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.orange,
@@ -738,30 +978,8 @@ class _LEDControlPageState extends State<LEDControlPage> {
                       SizedBox(height: 10),
                       ElevatedButton(
                         onPressed: () async {
-                          // Force permission request
                           print("Requesting all permissions...");
-
-                          if (Theme.of(context).platform == TargetPlatform.iOS) {
-                            try {
-                              var locationStatus = await Permission.locationWhenInUse.request();
-                              var sensorsStatus = await Permission.sensors.request();
-
-                              print("Location: $locationStatus, Sensors: $sensorsStatus");
-
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text("Location: $locationStatus, Sensors: $sensorsStatus")),
-                              );
-
-                              if (locationStatus.isGranted || sensorsStatus.isGranted) {
-                                _initSensors();
-                              }
-                            } catch (e) {
-                              print("Permission request error: $e");
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text("Permission error: $e")),
-                              );
-                            }
-                          }
+                          await _requestLocationPermission();
                         },
                         child: Text("Request Permissions"),
                         style: ElevatedButton.styleFrom(
