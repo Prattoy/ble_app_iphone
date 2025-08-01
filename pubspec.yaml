@@ -12,9 +12,9 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_blue_plus: ^1.12.13
-  permission_handler: ^11.0.1
+  permission_handler: ^11.3.1
   sensors_plus: ^3.1.0
-  flutter_compass: ^0.8.0
+  flutter_compass: ^0.8.1
 
 dev_dependencies:
   flutter_test:

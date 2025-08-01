@@ -30,10 +30,12 @@
 	<string>This app needs Bluetooth access to control LED lights via ESP32</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>This app needs Bluetooth access to control LED lights via ESP32</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>This app needs location access for compass functionality to control LEDs</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>To get location and direction</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>To get location and direction</string>
 	<key>NSMotionUsageDescription</key>
-	<string>This app needs motion access to detect phone flicks for LED control</string>
+	<string>This app needs motion sensors for flick detection</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

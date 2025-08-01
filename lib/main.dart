@@ -42,9 +42,14 @@ class _LEDControlPageState extends State<LEDControlPage> {
   double currentAcceleration = 0;
   double lastDelta = 0;
   DateTime? lastFlickTime;
-  int currentLED = 0; // Moved static variable to instance variable
-  late StreamSubscription<List<ScanResult>> scanSubscription;
-  late StreamSubscription<BluetoothConnectionState> connectionSubscription;
+  int currentLED = 0;
+  String sensorStatus = "Initializing...";
+
+  StreamSubscription<List<ScanResult>>? scanSubscription;
+  StreamSubscription<BluetoothConnectionState>? connectionSubscription;
+  StreamSubscription<AccelerometerEvent>? accelerometerSubscription;
+  StreamSubscription<UserAccelerometerEvent>? userAccelerometerSubscription;
+  StreamSubscription<GyroscopeEvent>? gyroscopeSubscription;
 
   // BLE Service and Characteristic UUIDs (must match ESP32)
   static const String SERVICE_UUID = "12345678-1234-1234-1234-123456789abc";
@@ -66,10 +71,8 @@ class _LEDControlPageState extends State<LEDControlPage> {
 
   Future<void> _checkBluetoothPermissions() async {
     if (Theme.of(context).platform == TargetPlatform.iOS) {
-      // iOS permissions
       await Permission.bluetooth.request();
     } else {
-      // Android permissions
       await Permission.bluetoothConnect.request();
       await Permission.bluetoothScan.request();
       await Permission.location.request();
@@ -77,22 +80,30 @@ class _LEDControlPageState extends State<LEDControlPage> {
   }
 
   Future<bool> _checkSensorPermissions() async {
-    // Check both location (for compass) and motion (for accelerometer)
+    print("Checking sensor permissions...");
+
+    // For iOS, we need location permission for compass
     PermissionStatus locationStatus = await Permission.locationWhenInUse.request();
-
-    // For iOS motion/sensor access
-    bool motionAvailable = true;
-    try {
-      // Test if accelerometer is available by checking if we can get a reading
-      await accelerometerEvents.take(1).timeout(Duration(seconds: 2));
-      print("Accelerometer is available");
-    } catch (e) {
-      print("Accelerometer not available: $e");
-      motionAvailable = false;
-    }
-
     print("Location permission: $locationStatus");
-    print("Motion available: $motionAvailable");
+
+    // For iOS 13+, we need to explicitly request sensors permission
+    if (Theme.of(context).platform == TargetPlatform.iOS) {
+      try {
+        PermissionStatus sensorsStatus = await Permission.sensors.request();
+        print("Sensors permission: $sensorsStatus");
+
+        if (!sensorsStatus.isGranted) {
+          print("Sensors permission denied");
+          setState(() {
+            sensorStatus = "Sensors permission denied";
+          });
+          return false;
+        }
+      } catch (e) {
+        print("Sensors permission error: $e");
+        // Continue anyway, might work without explicit permission
+      }
+    }
 
     return locationStatus.isGranted;
   }
@@ -100,8 +111,16 @@ class _LEDControlPageState extends State<LEDControlPage> {
   void _initSensors() async {
     if (!await _checkSensorPermissions()) {
       print("Location permissions denied");
+      setState(() {
+        sensorStatus = "Location permission denied";
+      });
       return;
     }
+
+    // Cancel existing subscriptions
+    accelerometerSubscription?.cancel();
+    userAccelerometerSubscription?.cancel();
+    gyroscopeSubscription?.cancel();
 
     try {
       // Compass listener
@@ -115,59 +134,112 @@ class _LEDControlPageState extends State<LEDControlPage> {
         print("Compass error: $error");
       });
 
-      // Accelerometer listener - SIMPLIFIED approach
-      accelerometerEvents.listen((AccelerometerEvent event) {
-        print("Accelerometer event received: x=${event.x}, y=${event.y}, z=${event.z}");
-        try {
-          // Simple total acceleration (gravity is ~9.8, so movement adds to this)
-          double totalAcceleration = (event.x * event.x + event.y * event.y + event.z * event.z).abs();
-
-          // Update display
-          if (mounted) {
-            setState(() {
-              currentAcceleration = totalAcceleration;
-              lastDelta = totalAcceleration; // Just show total for debugging
-            });
-          }
-
-          // Much simpler: if total acceleration exceeds gravity + movement threshold
-          if (totalAcceleration > 150 && (lastFlickTime == null ||
-              DateTime.now().difference(lastFlickTime!) > Duration(milliseconds: 800))) {
-            lastFlickTime = DateTime.now();
-            print("FLICK DETECTED! Total acceleration: $totalAcceleration");
-            _handleFlick();
-          }
-        } catch (e) {
-          print("Accelerometer error: $e");
-        }
+      print("Attempting to initialize sensors...");
+      setState(() {
+        sensorStatus = "Testing sensors...";
       });
 
-      // Try gyroscope as alternative to accelerometer
+      // Try regular accelerometer first
       try {
-        gyroscopeEvents.listen((GyroscopeEvent event) {
-          double rotationSpeed = (event.x.abs() + event.y.abs() + event.z.abs());
-          print("Gyroscope: ${rotationSpeed.toStringAsFixed(2)}");
+        print("Testing regular accelerometer...");
+        AccelerometerEvent? testEvent = await accelerometerEvents.first.timeout(
+          Duration(seconds: 2),
+        );
+        print("Regular accelerometer works: x=${testEvent.x}, y=${testEvent.y}, z=${testEvent.z}");
 
-          if (mounted) {
+        accelerometerSubscription = accelerometerEvents.listen((event) {
+          _processAccelerometerData(event.x, event.y, event.z, "regular");
+        });
+
+        setState(() {
+          sensorStatus = "Regular accelerometer active";
+        });
+      } catch (e) {
+        print("Regular accelerometer failed: $e");
+
+        // Try user accelerometer
+        try {
+          print("Testing user accelerometer...");
+          UserAccelerometerEvent? testUserEvent = await userAccelerometerEvents.first.timeout(
+            Duration(seconds: 2),
+          );
+          print("User accelerometer works: x=${testUserEvent.x}, y=${testUserEvent.y}, z=${testUserEvent.z}");
+
+          userAccelerometerSubscription = userAccelerometerEvents.listen((event) {
+            _processAccelerometerData(event.x, event.y, event.z, "user");
+          });
+
+          setState(() {
+            sensorStatus = "User accelerometer active";
+          });
+        } catch (e2) {
+          print("User accelerometer failed: $e2");
+
+          // Try gyroscope as last resort
+          try {
+            print("Testing gyroscope...");
+            GyroscopeEvent? testGyroEvent = await gyroscopeEvents.first.timeout(
+              Duration(seconds: 2),
+            );
+            print("Gyroscope works: x=${testGyroEvent.x}, y=${testGyroEvent.y}, z=${testGyroEvent.z}");
+
+            gyroscopeSubscription = gyroscopeEvents.listen((event) {
+              double rotationSpeed = (event.x.abs() + event.y.abs() + event.z.abs());
+              _processGyroscopeData(rotationSpeed);
+            });
+
             setState(() {
-              currentAcceleration = rotationSpeed * 100; // Scale for display
+              sensorStatus = "Gyroscope active";
+            });
+          } catch (e3) {
+            print("All sensors failed: $e3");
+            setState(() {
+              sensorStatus = "No sensors available";
+              currentAcceleration = -1;
             });
           }
-
-          // Detect quick rotation as "flick"
-          if (rotationSpeed > 3.0 && (lastFlickTime == null ||
-              DateTime.now().difference(lastFlickTime!) > Duration(milliseconds: 800))) {
-            lastFlickTime = DateTime.now();
-            print("ROTATION FLICK DETECTED! Speed: $rotationSpeed");
-            _handleFlick();
-          }
-        });
-        print("Using gyroscope for flick detection");
-      } catch (e) {
-        print("Gyroscope also failed: $e");
+        }
       }
     } catch (e) {
       print("Sensor initialization error: $e");
+      setState(() {
+        sensorStatus = "Sensor error: $e";
+      });
+    }
+  }
+
+  void _processAccelerometerData(double x, double y, double z, String type) {
+    double magnitude = (x * x + y * y + z * z).abs();
+
+    if (mounted) {
+      setState(() {
+        currentAcceleration = magnitude;
+      });
+    }
+
+    // Different thresholds for different sensor types
+    double threshold = type == "user" ? 20.0 : 150.0;
+
+    if (magnitude > threshold && (lastFlickTime == null ||
+        DateTime.now().difference(lastFlickTime!) > Duration(milliseconds: 800))) {
+      lastFlickTime = DateTime.now();
+      print("FLICK DETECTED ($type)! Magnitude: $magnitude");
+      _handleFlick();
+    }
+  }
+
+  void _processGyroscopeData(double rotationSpeed) {
+    if (mounted) {
+      setState(() {
+        currentAcceleration = rotationSpeed * 100; // Scale for display
+      });
+    }
+
+    if (rotationSpeed > 3.0 && (lastFlickTime == null ||
+        DateTime.now().difference(lastFlickTime!) > Duration(milliseconds: 800))) {
+      lastFlickTime = DateTime.now();
+      print("GYRO FLICK DETECTED! Speed: $rotationSpeed");
+      _handleFlick();
     }
   }
 
@@ -175,9 +247,8 @@ class _LEDControlPageState extends State<LEDControlPage> {
     if (!isConnected) return;
 
     if (heading == null) {
-      // Compass not available - cycle through LEDs instead
+      // Compass not available - cycle through LEDs
       List<String> pins = ['G32', 'G27', 'G25'];
-
       String pin = pins[currentLED];
       bool newState = !_getCurrentPinState(pin);
 
@@ -188,14 +259,12 @@ class _LEDControlPageState extends State<LEDControlPage> {
         if (pin == 'G25') led25 = newState;
       });
 
-      // Move to next LED for next flick
       currentLED = (currentLED + 1) % 3;
-
       print("Flick detected (no compass) - toggled $pin to ${newState ? 'ON' : 'OFF'}");
       return;
     }
 
-    // Original compass-based direction logic
+    // Compass-based direction logic
     for (var entry in lightSectors.entries) {
       int start = entry.value[0];
       int end = entry.value[1];
@@ -227,6 +296,19 @@ class _LEDControlPageState extends State<LEDControlPage> {
     }
   }
 
+  String _getSensorStatusText() {
+    if (currentAcceleration == -1) {
+      return "❌ All sensors failed";
+    } else if (currentAcceleration == 0) {
+      return "⏳ Waiting for sensor data...";
+    } else if (currentAcceleration > 0 && currentAcceleration < 50) {
+      return "✅ Sensors working (user accelerometer)";
+    } else if (currentAcceleration >= 50) {
+      return "✅ Sensors working (regular accelerometer/gyroscope)";
+    }
+    return "🔄 $sensorStatus";
+  }
+
   Future<void> startScan() async {
     if (isScanning) return;
 
@@ -237,7 +319,6 @@ class _LEDControlPageState extends State<LEDControlPage> {
     });
 
     try {
-      // Check if Bluetooth is on
       if (await FlutterBluePlus.isSupported == false) {
         setState(() {
           connectionStatus = "Bluetooth not supported";
@@ -246,7 +327,6 @@ class _LEDControlPageState extends State<LEDControlPage> {
         return;
       }
 
-      // Start scanning
       await FlutterBluePlus.startScan(timeout: Duration(seconds: 10));
 
       scanSubscription = FlutterBluePlus.scanResults.listen((results) {
@@ -262,7 +342,6 @@ class _LEDControlPageState extends State<LEDControlPage> {
         }
       });
 
-      // Stop scanning after timeout
       await Future.delayed(Duration(seconds: 10));
       await FlutterBluePlus.stopScan();
 
@@ -293,7 +372,6 @@ class _LEDControlPageState extends State<LEDControlPage> {
       await device.connect();
       connectedDevice = device;
 
-      // Listen to connection state
       connectionSubscription = device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
           setState(() {
@@ -305,7 +383,6 @@ class _LEDControlPageState extends State<LEDControlPage> {
         }
       });
 
-      // Discover services
       List<BluetoothService> services = await device.discoverServices();
 
       for (BluetoothService service in services) {
@@ -376,8 +453,11 @@ class _LEDControlPageState extends State<LEDControlPage> {
 
   @override
   void dispose() {
-    scanSubscription.cancel();
-    connectionSubscription.cancel();
+    scanSubscription?.cancel();
+    connectionSubscription?.cancel();
+    accelerometerSubscription?.cancel();
+    userAccelerometerSubscription?.cancel();
+    gyroscopeSubscription?.cancel();
     disconnect();
     super.dispose();
   }
@@ -548,7 +628,6 @@ class _LEDControlPageState extends State<LEDControlPage> {
                           PermissionStatus status = await Permission.locationWhenInUse.status;
 
                           if (status.isPermanentlyDenied) {
-                            // Show dialog to go to settings
                             showDialog(
                               context: context,
                               builder: (context) => AlertDialog(
@@ -571,7 +650,7 @@ class _LEDControlPageState extends State<LEDControlPage> {
                                   TextButton(
                                     onPressed: () {
                                       Navigator.pop(context);
-                                      openAppSettings(); // Opens app settings
+                                      openAppSettings();
                                     },
                                     child: Text("Open Settings"),
                                   ),
@@ -579,7 +658,6 @@ class _LEDControlPageState extends State<LEDControlPage> {
                               ),
                             );
                           } else {
-                            // Try to request permission
                             status = await Permission.locationWhenInUse.request();
                             print("Location permission status: $status");
 
@@ -587,7 +665,7 @@ class _LEDControlPageState extends State<LEDControlPage> {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(content: Text("Location permission granted! Compass should work now.")),
                               );
-                              _initSensors(); // Reinitialize sensors
+                              _initSensors();
                             } else if (status.isPermanentlyDenied) {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(content: Text("Permission permanently denied. Check app settings.")),
@@ -610,7 +688,7 @@ class _LEDControlPageState extends State<LEDControlPage> {
                 ),
               ),
 
-            // Test button for flick detection
+            // Sensor Debug Info
             if (isConnected)
               Card(
                 color: Colors.blue.shade50,
@@ -619,22 +697,75 @@ class _LEDControlPageState extends State<LEDControlPage> {
                   child: Column(
                     children: [
                       Text(
-                        "Flick Detection Debug",
+                        "Sensor Debug Info",
                         style: TextStyle(fontWeight: FontWeight.bold),
                       ),
                       SizedBox(height: 10),
-                      Text("Total Acceleration: ${currentAcceleration.toStringAsFixed(2)}"),
-                      Text("Threshold: 150 (need > this for flick)"),
-                      Text("Normal resting: ~100, Movement: 150+"),
+                      Text(_getSensorStatusText()),
+                      SizedBox(height: 10),
+                      Text("Current Value: ${currentAcceleration.toStringAsFixed(2)}"),
+                      Text("Regular Accel Threshold: 150"),
+                      Text("User Accel Threshold: 20"),
+                      Text("Gyroscope Threshold: 3.0"),
+                      SizedBox(height: 10),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: [
+                          ElevatedButton(
+                            onPressed: () {
+                              print("Manual flick test triggered");
+                              _handleFlick();
+                            },
+                            child: Text("Test Flick"),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blue,
+                              foregroundColor: Colors.white,
+                            ),
+                          ),
+                          ElevatedButton(
+                            onPressed: () {
+                              print("Reinitializing sensors...");
+                              _initSensors();
+                            },
+                            child: Text("Retry Sensors"),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.orange,
+                              foregroundColor: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
                       SizedBox(height: 10),
                       ElevatedButton(
-                        onPressed: () {
-                          print("Manual flick test triggered");
-                          _handleFlick();
+                        onPressed: () async {
+                          // Force permission request
+                          print("Requesting all permissions...");
+
+                          if (Theme.of(context).platform == TargetPlatform.iOS) {
+                            try {
+                              var locationStatus = await Permission.locationWhenInUse.request();
+                              var sensorsStatus = await Permission.sensors.request();
+
+                              print("Location: $locationStatus, Sensors: $sensorsStatus");
+
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text("Location: $locationStatus, Sensors: $sensorsStatus")),
+                              );
+
+                              if (locationStatus.isGranted || sensorsStatus.isGranted) {
+                                _initSensors();
+                              }
+                            } catch (e) {
+                              print("Permission request error: $e");
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text("Permission error: $e")),
+                              );
+                            }
+                          }
                         },
-                        child: Text("Simulate Flick"),
+                        child: Text("Request Permissions"),
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.blue,
+                          backgroundColor: Colors.green,
                           foregroundColor: Colors.white,
                         ),
                       ),
@@ -642,6 +773,8 @@ class _LEDControlPageState extends State<LEDControlPage> {
                   ),
                 ),
               ),
+
+            // Instructions
             Card(
               child: Padding(
                 padding: EdgeInsets.all(16.0),
